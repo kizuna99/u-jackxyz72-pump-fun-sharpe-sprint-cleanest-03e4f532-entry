@@ -162,6 +162,64 @@ function cleanupProbes(state: BotState): void {
   }
 }
 
+// Summary of one entry window's tape: buy/sell flow, price path, and how
+// concentrated the buying is. Computed once so entrySignal stays a flat
+// list of readable gates.
+interface WindowSummary {
+  buys: number;
+  buySol: number;
+  sellSol: number;
+  distinctBuyers: number;
+  topBuyerSol: number;
+  firstPrice: number;
+  lastPrice: number;
+  highPrice: number;
+  newerFlow: number;
+  olderFlow: number;
+}
+
+function summarizeWindow(window: TapeTrade[], slot: number): WindowSummary {
+  const buyerTotals = new Map<string, number>();
+  let buys = 0;
+  let buySol = 0;
+  let sellSol = 0;
+  let firstPrice = 0;
+  let lastPrice = 0;
+  let highPrice = 0;
+  let newerFlow = 0;
+  let olderFlow = 0;
+  for (let i = 0; i < window.length; i++) {
+    const trade = window[i];
+    if (trade.buy) {
+      buys += 1;
+      buySol += trade.sol;
+      buyerTotals.set(trade.user, (buyerTotals.get(trade.user) ?? 0) + trade.sol);
+    } else {
+      sellSol += trade.sol;
+    }
+    if (i === 0) firstPrice = trade.price;
+    lastPrice = trade.price;
+    if (trade.price > highPrice) highPrice = trade.price;
+    const flow = trade.buy ? trade.sol : -trade.sol;
+    if (slot - trade.slot <= FAST_WINDOW_SLOTS) newerFlow += flow;
+    else olderFlow += flow;
+  }
+  let topBuyerSol = 0;
+  for (const total of buyerTotals.values()) if (total > topBuyerSol) topBuyerSol = total;
+  return {
+    buys,
+    buySol,
+    sellSol,
+    distinctBuyers: buyerTotals.size,
+    topBuyerSol,
+    firstPrice,
+    lastPrice,
+    highPrice,
+    newerFlow,
+    olderFlow,
+  };
+}
+
 // Mature-momentum tape signal: old enough curve, healthy reserves, broad
 // buying with accelerating inflow, price up but still near its window high,
 // and no single buyer dominating the flow.
@@ -174,43 +232,17 @@ function entrySignal(state: BotState, mint: string, slot: number): boolean {
   if (t === undefined) return false;
   const created = t.created !== null ? t.created : c.created_slot;
   if (created === null || slot - created < 500) return false;
-  const w = t.trades.filter((x) => slot - x.slot <= ENTRY_WINDOW_SLOTS);
-  if (w.length < 3) return false;
-  const buyers = new Map<string, number>();
-  let buys = 0;
-  let buySol = 0;
-  let sellSol = 0;
-  let first = 0;
-  let last = 0;
-  let high = 0;
-  let newer = 0;
-  let older = 0;
-  for (let i = 0; i < w.length; i++) {
-    const tr = w[i];
-    if (tr.buy) {
-      buys += 1;
-      buySol += tr.sol;
-      buyers.set(tr.user, (buyers.get(tr.user) ?? 0) + tr.sol);
-    } else {
-      sellSol += tr.sol;
-    }
-    if (i === 0) first = tr.price;
-    last = tr.price;
-    if (tr.price > high) high = tr.price;
-    const flow = tr.buy ? tr.sol : -tr.sol;
-    if (slot - tr.slot <= FAST_WINDOW_SLOTS) newer += flow;
-    else older += flow;
-  }
-  if (buys < 3 || buyers.size < 5) return false;
-  if (buySol - sellSol < 1) return false;
-  if (first <= 0 || last <= 0) return false;
-  const gain = last / first;
+  const window = t.trades.filter((x) => slot - x.slot <= ENTRY_WINDOW_SLOTS);
+  if (window.length < 3) return false;
+  const s = summarizeWindow(window, slot);
+  if (s.buys < 3 || s.distinctBuyers < 5) return false;
+  if (s.buySol - s.sellSol < 1) return false;
+  if (s.firstPrice <= 0 || s.lastPrice <= 0) return false;
+  const gain = s.lastPrice / s.firstPrice;
   if (gain < 1.05 || gain > 2.5) return false;
-  if (last < 0.95 * high) return false;
-  if (!(newer > 0 && newer >= older)) return false;
-  let top = 0;
-  for (const v of buyers.values()) if (v > top) top = v;
-  if (top > 0.6 * buySol) return false;
+  if (s.lastPrice < 0.95 * s.highPrice) return false;
+  if (!(s.newerFlow > 0 && s.newerFlow >= s.olderFlow)) return false;
+  if (s.topBuyerSol > 0.6 * s.buySol) return false;
   return true;
 }
 
