@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: MIT
-// Hourly Sharpe rewards steady, low-variance equity growth rather than a few lottery wins.
-// So this bot keeps exposure small and nearly constant (fixed size, hard position and exposure
-// caps), banks gains early, cuts losers quickly, and diversifies across many independent mints
-// with tiny probes. It also refuses orders that cannot clear fees, size caps or complete curves.
+// Hourly Sharpe rewards a smooth equity curve, not one lucky moonshot.
+// This bot therefore trades small and nearly constant: one fixed stake per
+// position, hard caps on open positions and total exposure, early profit
+// banking, quick loss cutting, and many independent mints through tiny
+// guardrail probes. It never sends an order that cannot clear fees, the
+// sizing caps, or an incomplete curve.
 
 import { LAMPORTS_PER_SOL, runBot } from './vendor/makefun-bot.ts';
 import type { Batch, BotState, BuyInput, OrderInput, SellInput } from './vendor/makefun-bot.ts';
 
+// --- Sizing and fee constants (lamports) -------------------------------------
 const SOL = Number(LAMPORTS_PER_SOL);
-const ENTRY = 150_000_000n;
-const PROBE = 10_000_000n;
-const MAX_EXPOSURE = 900_000_000n;
-const FEE_NUM = 9875n;
-const MAX_MOMENTUM = 4;
-const MAX_SLOTS = 5;
-const TAPE_WINDOW = 35;
-const ENTRY_WINDOW = 30;
-const FAST_WINDOW = 15;
+const ENTRY_LAMPORTS = 150_000_000n; // 0.15 SOL per momentum position
+const PROBE_LAMPORTS = 10_000_000n; // 0.01 SOL guardrail probe round trip
+const MAX_EXPOSURE_LAMPORTS = 900_000_000n; // 0.90 SOL total open cost
+const FEE_KEEP_NUM = 9875n; // keep 98.75% after the 1.25% round-trip fee drag
+
+// --- Strategy thresholds -----------------------------------------------------
+const MAX_MOMENTUM_POSITIONS = 4;
+const MAX_OPEN_SLOTS = 5;
+const TAPE_WINDOW_SLOTS = 35;
+const ENTRY_WINDOW_SLOTS = 30;
+const FAST_WINDOW_SLOTS = 15;
+const PACE_HORIZON_SECONDS = 14400; // 4h of block time maps pace 0 -> 1
 
 interface TapeTrade {
   slot: number;
@@ -40,13 +46,14 @@ interface SentMeta {
   side: OrderSide;
 }
 
+// --- Mutable per-run state (insertion-ordered maps only: deterministic) ------
 const tape = new Map<string, Tape>();
-const peak = new Map<string, bigint>();
+const peakValue = new Map<string, bigint>();
 const entrySlot = new Map<string, number>();
 const cooldownUntil = new Map<string, number>();
 const entryCount = new Map<string, number>();
 const probeMints = new Set<string>();
-const sent = new Map<string, SentMeta>();
+const sentOrders = new Map<string, SentMeta>();
 const ownMints = new Set<string>();
 let ownFillCount = 0;
 let firstBlockTime: number | null = null;
@@ -61,6 +68,7 @@ function getTape(mint: string): Tape {
   return t;
 }
 
+// Record creations/trades from this batch and drop tape older than the window.
 function observeEvents(batch: Batch): void {
   for (const e of batch.events) {
     if (typeof e.block_time === 'number') {
@@ -71,33 +79,37 @@ function observeEvents(batch: Batch): void {
     if (e.event === 'CreateEvent') {
       if (t.created === null) t.created = e.slot;
     } else if (e.event === 'TradeEvent') {
-      const q = Number(e.virtual_quote_reserves);
-      const v = Number(e.virtual_token_reserves);
+      const quote = Number(e.virtual_quote_reserves);
+      const tokens = Number(e.virtual_token_reserves);
       t.trades.push({
         slot: e.slot,
         buy: e.is_buy,
         sol: Number(e.sol_amount) / SOL,
         user: e.user,
-        price: v > 0 ? q / v : 0,
+        price: tokens > 0 ? quote / tokens : 0,
       });
     }
   }
   for (const t of tape.values()) {
     let cut = 0;
-    while (cut < t.trades.length && batch.slot - t.trades[cut].slot > TAPE_WINDOW) cut++;
+    while (cut < t.trades.length && batch.slot - t.trades[cut].slot > TAPE_WINDOW_SLOTS) cut++;
     if (cut > 0) t.trades.splice(0, cut);
   }
 }
 
+// Net lamports a full sell of `tokens` would return after fees.
 function valueLamports(state: BotState, mint: string, tokens: bigint): bigint {
   const c = state.curves.get(mint);
   if (c === undefined) return 0n;
   const denom = c.virtual_token_reserves + tokens;
   if (denom <= 0n) return 0n;
   const gross = (tokens * c.virtual_quote_reserves) / denom;
-  return (gross * FEE_NUM) / 10000n - state.txFeeLamports();
+  return (gross * FEE_KEEP_NUM) / 10000n - state.txFeeLamports();
 }
 
+// Apply fills. Guardrail accounting counts ONLY filled own fills: a rejected
+// or failed fill never advances the 20-mint bar, so probes keep firing until
+// real round trips land.
 function processFills(state: BotState, batch: Batch): void {
   for (const f of batch.fills) {
     const own = !f.client_id.startsWith('_');
@@ -105,10 +117,11 @@ function processFills(state: BotState, batch: Batch): void {
       ownFillCount += 1;
       ownMints.add(f.mint);
     }
-    const meta = sent.get(f.client_id);
+    const meta = sentOrders.get(f.client_id);
     if (meta !== undefined) {
-      sent.delete(f.client_id);
+      sentOrders.delete(f.client_id);
       if (f.status !== 'filled') {
+        // A failed probe buy frees the mint for a later probe attempt.
         if (meta.side === 'buy' && meta.kind === 'probe') probeMints.delete(f.mint);
         continue;
       }
@@ -116,22 +129,24 @@ function processFills(state: BotState, batch: Batch): void {
         entrySlot.set(f.mint, f.slot);
         entryCount.set(f.mint, (entryCount.get(f.mint) ?? 0) + 1);
         const h = state.positions.get(f.mint);
-        if (h !== undefined) peak.set(f.mint, valueLamports(state, f.mint, h.token_amount));
+        if (h !== undefined) peakValue.set(f.mint, valueLamports(state, f.mint, h.token_amount));
       } else {
         cooldownUntil.set(f.mint, f.slot + 150);
-        peak.delete(f.mint);
+        peakValue.delete(f.mint);
         entrySlot.delete(f.mint);
         if (meta.kind === 'probe') probeMints.delete(f.mint);
       }
     } else if (f.status === 'filled' && f.side === 'sell') {
+      // A sell we did not track (e.g. after a restart) still cools the mint down.
       cooldownUntil.set(f.mint, f.slot + 150);
-      peak.delete(f.mint);
+      peakValue.delete(f.mint);
       entrySlot.delete(f.mint);
       probeMints.delete(f.mint);
     }
   }
 }
 
+// Drop probe markers whose mint has neither a position nor a pending order.
 function cleanupProbes(state: BotState): void {
   for (const mint of [...probeMints]) {
     let busy = state.positions.has(mint);
@@ -147,6 +162,9 @@ function cleanupProbes(state: BotState): void {
   }
 }
 
+// Mature-momentum tape signal: old enough curve, healthy reserves, broad
+// buying with accelerating inflow, price up but still near its window high,
+// and no single buyer dominating the flow.
 function entrySignal(state: BotState, mint: string, slot: number): boolean {
   const c = state.curves.get(mint);
   if (c === undefined || c.complete) return false;
@@ -156,7 +174,7 @@ function entrySignal(state: BotState, mint: string, slot: number): boolean {
   if (t === undefined) return false;
   const created = t.created !== null ? t.created : c.created_slot;
   if (created === null || slot - created < 500) return false;
-  const w = t.trades.filter((x) => slot - x.slot <= ENTRY_WINDOW);
+  const w = t.trades.filter((x) => slot - x.slot <= ENTRY_WINDOW_SLOTS);
   if (w.length < 3) return false;
   const buyers = new Map<string, number>();
   let buys = 0;
@@ -180,7 +198,7 @@ function entrySignal(state: BotState, mint: string, slot: number): boolean {
     last = tr.price;
     if (tr.price > high) high = tr.price;
     const flow = tr.buy ? tr.sol : -tr.sol;
-    if (slot - tr.slot <= FAST_WINDOW) newer += flow;
+    if (slot - tr.slot <= FAST_WINDOW_SLOTS) newer += flow;
     else older += flow;
   }
   if (buys < 3 || buyers.size < 5) return false;
@@ -196,11 +214,46 @@ function entrySignal(state: BotState, mint: string, slot: number): boolean {
   return true;
 }
 
-function currentPace(): number {
+// Fraction of the 4h pacing horizon covered by observed block time.
+function paceFraction(): number {
   if (firstBlockTime === null || lastBlockTime === null) return 0;
   const elapsed = lastBlockTime - firstBlockTime;
   if (elapsed <= 0) return 0;
-  return Math.min(1, elapsed / 14400);
+  return Math.min(1, elapsed / PACE_HORIZON_SECONDS);
+}
+
+// Momentum exit decision for one open position. Updates the trailing peak
+// first, then checks: +10% take-profit, -10% stop-loss, trailing stop armed
+// at +5% with an 8% trail, fast-window flow fade, same-slot big sell, and
+// the 1200-slot time stop.
+function positionShouldExit(
+  state: BotState,
+  mint: string,
+  cost: bigint,
+  tokens: bigint,
+  slot: number,
+): boolean {
+  const value = valueLamports(state, mint, tokens);
+  const prev = peakValue.get(mint);
+  const high = prev === undefined || value > prev ? value : prev;
+  peakValue.set(mint, high);
+  if (value >= (cost * 11n) / 10n) return true;
+  if (value <= (cost * 9n) / 10n) return true;
+  if (high >= (cost * 105n) / 100n && value <= (high * 92n) / 100n) return true;
+  const t = tape.get(mint);
+  if (t !== undefined) {
+    let net = 0;
+    let bigSell = 0;
+    for (const tr of t.trades) {
+      if (slot - tr.slot <= FAST_WINDOW_SLOTS) net += tr.buy ? tr.sol : -tr.sol;
+      if (tr.slot === slot && !tr.buy) bigSell += tr.sol;
+    }
+    if (net < -1) return true;
+    if (bigSell >= 3) return true;
+  }
+  const start = entrySlot.get(mint);
+  if (start !== undefined && slot - start >= 1200) return true;
+  return false;
 }
 
 runBot({
@@ -227,7 +280,7 @@ runBot({
       if (orders.length >= cap) return;
       const id = state.clientId();
       const o: BuyInput = { side: 'buy', client_id: id, mint, quote_lamports: amount, max_slippage_bps: 1500 };
-      sent.set(id, { mint, kind, side: 'buy' });
+      sentOrders.set(id, { mint, kind, side: 'buy' });
       orders.push(o);
       pendingMints.add(mint);
       reserved.add(mint);
@@ -239,7 +292,7 @@ runBot({
       if (orders.length >= cap) return;
       const id = state.clientId();
       const o: SellInput = { side: 'sell', client_id: id, mint, token_amount: tokens, max_slippage_bps: 10000 };
-      sent.set(id, { mint, kind, side: 'sell' });
+      sentOrders.set(id, { mint, kind, side: 'sell' });
       orders.push(o);
       pendingMints.add(mint);
     }
@@ -250,36 +303,19 @@ runBot({
       return n;
     }
 
+    // 1) Exits for momentum positions: +10% TP, -10% SL, trailing stop armed
+    // at +5% with an 8% trail, flow fade, same-slot big sell, 1200-slot cap.
     for (const [mint, h] of state.positions) {
       if (orders.length >= cap) break;
       if (probeMints.has(mint) || pendingMints.has(mint)) continue;
       const c = state.curves.get(mint);
       if (c === undefined || c.complete) continue;
-      const value = valueLamports(state, mint, h.token_amount);
-      const prev = peak.get(mint);
-      const high = prev === undefined || value > prev ? value : prev;
-      peak.set(mint, high);
-      const cost = h.cost_lamports;
-      let exit = false;
-      if (value >= (cost * 11n) / 10n) exit = true;
-      if (value <= (cost * 9n) / 10n) exit = true;
-      if (high >= (cost * 105n) / 100n && value <= (high * 92n) / 100n) exit = true;
-      const t = tape.get(mint);
-      if (t !== undefined) {
-        let net = 0;
-        let bigSell = 0;
-        for (const tr of t.trades) {
-          if (slot - tr.slot <= FAST_WINDOW) net += tr.buy ? tr.sol : -tr.sol;
-          if (tr.slot === slot && !tr.buy) bigSell += tr.sol;
-        }
-        if (net < -1) exit = true;
-        if (bigSell >= 3) exit = true;
+      if (positionShouldExit(state, mint, h.cost_lamports, h.token_amount, slot)) {
+        addSell(mint, h.token_amount, 'momentum');
       }
-      const start = entrySlot.get(mint);
-      if (start !== undefined && slot - start >= 1200) exit = true;
-      if (exit) addSell(mint, h.token_amount, 'momentum');
     }
 
+    // 2) Probe positions exit immediately on the next batch (round trip done).
     for (const mint of probeMints) {
       if (orders.length >= cap) break;
       if (pendingMints.has(mint)) continue;
@@ -290,21 +326,26 @@ runBot({
       addSell(mint, h.token_amount, 'probe');
     }
 
+    // 3) New momentum entries, at most MAX_MOMENTUM_POSITIONS open, no
+    // re-entry within cooldown, at most 2 entries per mint ever.
     for (const mint of tape.keys()) {
       if (orders.length >= cap) break;
-      if (momentumCount() >= MAX_MOMENTUM) break;
+      if (momentumCount() >= MAX_MOMENTUM_POSITIONS) break;
       if (state.positions.has(mint) || pendingMints.has(mint) || probeMints.has(mint)) continue;
       const cd = cooldownUntil.get(mint);
       if (cd !== undefined && slot < cd) continue;
       if ((entryCount.get(mint) ?? 0) >= 2) continue;
       if (!entrySignal(state, mint, slot)) continue;
-      if (state.maxBuyLamports(mint) < ENTRY) continue;
-      if (exposure + ENTRY > MAX_EXPOSURE) continue;
-      if (cash - tx < ENTRY) continue;
-      addBuy(mint, ENTRY, 'momentum');
+      if (state.maxBuyLamports(mint) < ENTRY_LAMPORTS) continue;
+      if (exposure + ENTRY_LAMPORTS > MAX_EXPOSURE_LAMPORTS) continue;
+      if (cash - tx < ENTRY_LAMPORTS) continue;
+      addBuy(mint, ENTRY_LAMPORTS, 'momentum');
     }
 
-    const pace = currentPace();
+    // 4) Guardrail probes: paced by elapsed block time toward 30 distinct
+    // mints / 200 own fills, so the run clears the 20-mint bar even when
+    // momentum signals are scarce. Fresh mints first, then any liquid mint.
+    const pace = paceFraction();
     const needMints = Math.ceil(30 * pace);
     const needFills = Math.ceil(200 * pace);
     const probeNeeded = ownMints.size < needMints || ownFillCount < needFills;
@@ -329,12 +370,12 @@ runBot({
           if (Number(c.real_quote_reserves) < SOL) continue;
           if (state.positions.has(mint) || pendingMints.has(mint) || probeMints.has(mint)) continue;
           if ((entryCount.get(mint) ?? 0) >= 2) continue;
-          if (reserved.size >= MAX_SLOTS) continue;
-          if (state.maxBuyLamports(mint) < PROBE) continue;
-          if (exposure + PROBE > MAX_EXPOSURE) continue;
-          if (cash - tx < PROBE) continue;
+          if (reserved.size >= MAX_OPEN_SLOTS) continue;
+          if (state.maxBuyLamports(mint) < PROBE_LAMPORTS) continue;
+          if (exposure + PROBE_LAMPORTS > MAX_EXPOSURE_LAMPORTS) continue;
+          if (cash - tx < PROBE_LAMPORTS) continue;
           probeMints.add(mint);
-          addBuy(mint, PROBE, 'probe');
+          addBuy(mint, PROBE_LAMPORTS, 'probe');
           return true;
         }
         return false;
